@@ -4,10 +4,10 @@ import functools
 import hashlib
 import json
 import os
-import resource
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from sky import exceptions
 from sky import provision
 from sky import sky_logging
 from sky.provision import common
@@ -19,11 +19,10 @@ from sky.utils import accelerator_registry
 from sky.utils import command_runner
 from sky.utils import common_utils
 from sky.utils import subprocess_utils
+from sky.utils import timeline
 from sky.utils import ux_utils
 
 logger = sky_logging.init_logger(__name__)
-_START_TITLE = '\n' + '-' * 20 + 'Start: {} ' + '-' * 20
-_END_TITLE = '-' * 20 + 'End:   {} ' + '-' * 20 + '\n'
 
 _MAX_RETRY = 6
 
@@ -68,42 +67,34 @@ MAYBE_SKYLET_RESTART_CMD = (f'{constants.ACTIVATE_SKY_REMOTE_PYTHON_ENV}; '
                             'sky.skylet.attempt_skylet;')
 
 
-def _auto_retry(func):
+def _auto_retry(should_retry: Callable[[Exception], bool] = lambda _: True):
     """Decorator that retries the function if it fails.
 
     This decorator is mostly for SSH disconnection issues, which might happen
     during the setup of instances.
     """
 
-    @functools.wraps(func)
-    def retry(*args, **kwargs):
-        backoff = common_utils.Backoff(initial_backoff=1, max_backoff_factor=5)
-        for retry_cnt in range(_MAX_RETRY):
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:  # pylint: disable=broad-except
-                if retry_cnt >= _MAX_RETRY - 1:
-                    raise e
-                sleep = backoff.current_backoff()
-                logger.info(
-                    f'{func.__name__}: Retrying in {sleep:.1f} seconds, '
-                    f'due to {e}')
-                time.sleep(sleep)
+    def decorator(func):
 
-    return retry
+        @functools.wraps(func)
+        def retry(*args, **kwargs):
+            backoff = common_utils.Backoff(initial_backoff=1,
+                                           max_backoff_factor=5)
+            for retry_cnt in range(_MAX_RETRY):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:  # pylint: disable=broad-except
+                    if not should_retry(e) or retry_cnt >= _MAX_RETRY - 1:
+                        raise
+                    sleep = backoff.current_backoff()
+                    logger.info(
+                        f'{func.__name__}: Retrying in {sleep:.1f} seconds, '
+                        f'due to {e}')
+                    time.sleep(sleep)
 
+        return retry
 
-def _log_start_end(func):
-
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        logger.info(_START_TITLE.format(func.__name__))
-        try:
-            return func(*args, **kwargs)
-        finally:
-            logger.info(_END_TITLE.format(func.__name__))
-
-    return wrapper
+    return decorator
 
 
 def _hint_worker_log_path(cluster_name: str, cluster_info: common.ClusterInfo,
@@ -124,7 +115,8 @@ def _parallel_ssh_with_cache(func,
     if max_workers is None:
         # Not using the default value of `max_workers` in ThreadPoolExecutor,
         # as 32 is too large for some machines.
-        max_workers = subprocess_utils.get_parallel_threads()
+        max_workers = subprocess_utils.get_parallel_threads(
+            cluster_info.provider_name)
     with futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         results = []
         runners = provision.get_command_runners(cluster_info.provider_name,
@@ -147,7 +139,7 @@ def _parallel_ssh_with_cache(func,
         return [future.result() for future in results]
 
 
-@_log_start_end
+@common.log_function_start_end
 def initialize_docker(cluster_name: str, docker_config: Dict[str, Any],
                       cluster_info: common.ClusterInfo,
                       ssh_credentials: Dict[str, Any]) -> Optional[str]:
@@ -156,7 +148,8 @@ def initialize_docker(cluster_name: str, docker_config: Dict[str, Any],
         return None
     _hint_worker_log_path(cluster_name, cluster_info, 'initialize_docker')
 
-    @_auto_retry
+    @_auto_retry(should_retry=lambda e: isinstance(e, exceptions.CommandError)
+                 and e.returncode == 255)
     def _initialize_docker(runner: command_runner.CommandRunner, log_path: str):
         docker_user = docker_utils.DockerInitializer(docker_config, runner,
                                                      log_path).initialize()
@@ -177,7 +170,8 @@ def initialize_docker(cluster_name: str, docker_config: Dict[str, Any],
     return docker_users[0]
 
 
-@_log_start_end
+@common.log_function_start_end
+@timeline.event
 def setup_runtime_on_cluster(cluster_name: str, setup_commands: List[str],
                              cluster_info: common.ClusterInfo,
                              ssh_credentials: Dict[str, Any]) -> None:
@@ -193,7 +187,7 @@ def setup_runtime_on_cluster(cluster_name: str, setup_commands: List[str],
         hasher.update(d)
     digest = hasher.hexdigest()
 
-    @_auto_retry
+    @_auto_retry()
     def _setup_node(runner: command_runner.CommandRunner, log_path: str):
         for cmd in setup_commands:
             returncode, stdout, stderr = runner.run(
@@ -253,8 +247,88 @@ def _ray_gpu_options(custom_resource: str) -> str:
     return f' --num-gpus={acc_count}'
 
 
-@_log_start_end
-@_auto_retry
+def ray_head_start_command(custom_resource: Optional[str],
+                           custom_ray_options: Optional[Dict[str, Any]]) -> str:
+    """Returns the command to start Ray on the head node."""
+    ray_options = (
+        # --disable-usage-stats in `ray start` saves 10 seconds of idle wait.
+        f'--disable-usage-stats '
+        f'--port={constants.SKY_REMOTE_RAY_PORT} '
+        f'--dashboard-port={constants.SKY_REMOTE_RAY_DASHBOARD_PORT} '
+        f'--min-worker-port 11002 '
+        f'--object-manager-port=8076 '
+        f'--temp-dir={constants.SKY_REMOTE_RAY_TEMPDIR}')
+    if custom_resource:
+        ray_options += f' --resources=\'{custom_resource}\''
+        ray_options += _ray_gpu_options(custom_resource)
+    if custom_ray_options:
+        if 'use_external_ip' in custom_ray_options:
+            custom_ray_options.pop('use_external_ip')
+        for key, value in custom_ray_options.items():
+            ray_options += f' --{key}={value}'
+
+    cmd = (
+        f'{constants.SKY_RAY_CMD} stop; '
+        'RAY_SCHEDULER_EVENTS=0 RAY_DEDUP_LOGS=0 '
+        # worker_maximum_startup_concurrency controls the maximum number of
+        # workers that can be started concurrently. However, it also controls
+        # this warning message:
+        # https://github.com/ray-project/ray/blob/d5d03e6e24ae3cfafb87637ade795fb1480636e6/src/ray/raylet/worker_pool.cc#L1535-L1545
+        # maximum_startup_concurrency defaults to the number of CPUs given by
+        # multiprocessing.cpu_count() or manually specified to ray. (See
+        # https://github.com/ray-project/ray/blob/fab26e1813779eb568acba01281c6dd963c13635/python/ray/_private/services.py#L1622-L1624.)
+        # The warning will show when the number of workers is >4x the
+        # maximum_startup_concurrency, so typically 4x CPU count. However, the
+        # job controller uses 0.25cpu reservations, and each job can use two
+        # workers (one for the submitted job and one for remote actors),
+        # resulting in a worker count of 8x CPUs or more. Increase the
+        # worker_maximum_startup_concurrency to 3x CPUs so that we will only see
+        # the warning when the worker count is >12x CPUs.
+        'RAY_worker_maximum_startup_concurrency=$(( 3 * $(nproc --all) )) '
+        f'{constants.SKY_RAY_CMD} start --head {ray_options} || exit 1;' +
+        _RAY_PRLIMIT + _DUMP_RAY_PORTS + RAY_HEAD_WAIT_INITIALIZED_COMMAND)
+    return cmd
+
+
+def ray_worker_start_command(custom_resource: Optional[str],
+                             custom_ray_options: Optional[Dict[str, Any]],
+                             no_restart: bool) -> str:
+    """Returns the command to start Ray on the worker node."""
+    # We need to use the ray port in the env variable, because the head node
+    # determines the port to be used for the worker node.
+    ray_options = ('--address=${SKYPILOT_RAY_HEAD_IP}:${SKYPILOT_RAY_PORT} '
+                   '--object-manager-port=8076')
+
+    if custom_resource:
+        ray_options += f' --resources=\'{custom_resource}\''
+        ray_options += _ray_gpu_options(custom_resource)
+
+    if custom_ray_options:
+        for key, value in custom_ray_options.items():
+            ray_options += f' --{key}={value}'
+
+    cmd = (
+        'RAY_SCHEDULER_EVENTS=0 RAY_DEDUP_LOGS=0 '
+        f'{constants.SKY_RAY_CMD} start --disable-usage-stats {ray_options} || '
+        'exit 1;' + _RAY_PRLIMIT)
+    if no_restart:
+        # We do not use ray status to check whether ray is running, because
+        # on worker node, if the user started their own ray cluster, ray status
+        # will return 0, i.e., we don't know skypilot's ray cluster is running.
+        # Instead, we check whether the raylet process is running on gcs address
+        # that is connected to the head with the correct port.
+        cmd = (
+            f'ps aux | grep "ray/raylet/raylet" | '
+            'grep "gcs-address=${SKYPILOT_RAY_HEAD_IP}:${SKYPILOT_RAY_PORT}" '
+            f'|| {{ {cmd} }}')
+    else:
+        cmd = f'{constants.SKY_RAY_CMD} stop; ' + cmd
+    return cmd
+
+
+@common.log_function_start_end
+@_auto_retry()
+@timeline.event
 def start_ray_on_head_node(cluster_name: str, custom_resource: Optional[str],
                            cluster_info: common.ClusterInfo,
                            ssh_credentials: Dict[str, Any]) -> None:
@@ -267,35 +341,8 @@ def start_ray_on_head_node(cluster_name: str, custom_resource: Optional[str],
 
     # Log the head node's output to the provision.log
     log_path_abs = str(provision_logging.get_log_path())
-    ray_options = (
-        # --disable-usage-stats in `ray start` saves 10 seconds of idle wait.
-        f'--disable-usage-stats '
-        f'--port={constants.SKY_REMOTE_RAY_PORT} '
-        f'--dashboard-port={constants.SKY_REMOTE_RAY_DASHBOARD_PORT} '
-        f'--object-manager-port=8076 '
-        f'--temp-dir={constants.SKY_REMOTE_RAY_TEMPDIR}')
-    if custom_resource:
-        ray_options += f' --resources=\'{custom_resource}\''
-        ray_options += _ray_gpu_options(custom_resource)
-
-    if cluster_info.custom_ray_options:
-        if 'use_external_ip' in cluster_info.custom_ray_options:
-            cluster_info.custom_ray_options.pop('use_external_ip')
-        for key, value in cluster_info.custom_ray_options.items():
-            ray_options += f' --{key}={value}'
-
-    # Unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY to avoid using credentials
-    # from environment variables set by user. SkyPilot's ray cluster should use
-    # the `~/.aws/` credentials, as that is the one used to create the cluster,
-    # and the autoscaler module started by the `ray start` command should use
-    # the same credentials. Otherwise, `ray status` will fail to fetch the
-    # available nodes.
-    # Reference: https://github.com/skypilot-org/skypilot/issues/2441
-    cmd = (f'{constants.SKY_RAY_CMD} stop; '
-           'unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; '
-           'RAY_SCHEDULER_EVENTS=0 RAY_DEDUP_LOGS=0 '
-           f'{constants.SKY_RAY_CMD} start --head {ray_options} || exit 1;' +
-           _RAY_PRLIMIT + _DUMP_RAY_PORTS + RAY_HEAD_WAIT_INITIALIZED_COMMAND)
+    cmd = ray_head_start_command(custom_resource,
+                                 cluster_info.custom_ray_options)
     logger.info(f'Running command on head node: {cmd}')
     # TODO(zhwu): add the output to log files.
     returncode, stdout, stderr = head_runner.run(
@@ -313,8 +360,9 @@ def start_ray_on_head_node(cluster_name: str, custom_resource: Optional[str],
                            f'===== stderr ====={stderr}')
 
 
-@_log_start_end
-@_auto_retry
+@common.log_function_start_end
+@_auto_retry()
+@timeline.event
 def start_ray_on_worker_nodes(cluster_name: str, no_restart: bool,
                               custom_resource: Optional[str], ray_port: int,
                               cluster_info: common.ClusterInfo,
@@ -349,43 +397,17 @@ def start_ray_on_worker_nodes(cluster_name: str, no_restart: bool,
     head_ip = (head_instance.internal_ip
                if not use_external_ip else head_instance.external_ip)
 
-    ray_options = (f'--address={head_ip}:{constants.SKY_REMOTE_RAY_PORT} '
-                   f'--object-manager-port=8076')
+    ray_cmd = ray_worker_start_command(custom_resource,
+                                       cluster_info.custom_ray_options,
+                                       no_restart)
 
-    if custom_resource:
-        ray_options += f' --resources=\'{custom_resource}\''
-        ray_options += _ray_gpu_options(custom_resource)
-
-    if cluster_info.custom_ray_options:
-        for key, value in cluster_info.custom_ray_options.items():
-            ray_options += f' --{key}={value}'
-
-    # Unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY, see the comment in
-    # `start_ray_on_head_node`.
-    cmd = (
-        f'unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; '
-        'RAY_SCHEDULER_EVENTS=0 RAY_DEDUP_LOGS=0 '
-        f'{constants.SKY_RAY_CMD} start --disable-usage-stats {ray_options} || '
-        'exit 1;' + _RAY_PRLIMIT)
-    if no_restart:
-        # We do not use ray status to check whether ray is running, because
-        # on worker node, if the user started their own ray cluster, ray status
-        # will return 0, i.e., we don't know skypilot's ray cluster is running.
-        # Instead, we check whether the raylet process is running on gcs address
-        # that is connected to the head with the correct port.
-        cmd = (f'RAY_PORT={ray_port}; ps aux | grep "ray/raylet/raylet" | '
-               f'grep "gcs-address={head_ip}:${{RAY_PORT}}" || '
-               f'{{ {cmd} }}')
-    else:
-        cmd = f'{constants.SKY_RAY_CMD} stop; ' + cmd
+    cmd = (f'export SKYPILOT_RAY_HEAD_IP="{head_ip}"; '
+           f'export SKYPILOT_RAY_PORT={ray_port}; ' + ray_cmd)
 
     logger.info(f'Running command on worker nodes: {cmd}')
 
     def _setup_ray_worker(runner_and_id: Tuple[command_runner.CommandRunner,
                                                str]):
-        # for cmd in config_from_yaml['worker_start_ray_commands']:
-        #     cmd = cmd.replace('$RAY_HEAD_IP', ip_list[0][0])
-        #     runner.run(cmd)
         runner, instance_id = runner_and_id
         log_dir = metadata_utils.get_instance_log_dir(cluster_name, instance_id)
         log_path_abs = str(log_dir / ('ray_cluster' + '.log'))
@@ -398,8 +420,10 @@ def start_ray_on_worker_nodes(cluster_name: str, no_restart: bool,
             # by ray will have the correct PATH.
             source_bashrc=True)
 
+    num_threads = subprocess_utils.get_parallel_threads(
+        cluster_info.provider_name)
     results = subprocess_utils.run_in_parallel(
-        _setup_ray_worker, list(zip(worker_runners, cache_ids)))
+        _setup_ray_worker, list(zip(worker_runners, cache_ids)), num_threads)
     for returncode, stdout, stderr in results:
         if returncode:
             with ux_utils.print_exception_no_traceback():
@@ -410,8 +434,9 @@ def start_ray_on_worker_nodes(cluster_name: str, no_restart: bool,
                                    f'===== stderr ====={stderr}')
 
 
-@_log_start_end
-@_auto_retry
+@common.log_function_start_end
+@_auto_retry()
+@timeline.event
 def start_skylet_on_head_node(cluster_name: str,
                               cluster_info: common.ClusterInfo,
                               ssh_credentials: Dict[str, Any]) -> None:
@@ -437,7 +462,7 @@ def start_skylet_on_head_node(cluster_name: str,
                            f'===== stderr ====={stderr}')
 
 
-@_auto_retry
+@_auto_retry()
 def _internal_file_mounts(file_mounts: Dict,
                           runner: command_runner.CommandRunner,
                           log_path: str) -> None:
@@ -473,28 +498,8 @@ def _internal_file_mounts(file_mounts: Dict,
         )
 
 
-def _max_workers_for_file_mounts(common_file_mounts: Dict[str, str]) -> int:
-    fd_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-
-    fd_per_rsync = 5
-    for src in common_file_mounts.values():
-        if os.path.isdir(src):
-            # Assume that each file/folder under src takes 5 file descriptors
-            # on average.
-            fd_per_rsync = max(fd_per_rsync, len(os.listdir(src)) * 5)
-
-    # Reserve some file descriptors for the system and other processes
-    fd_reserve = 100
-
-    max_workers = (fd_limit - fd_reserve) // fd_per_rsync
-    # At least 1 worker, and avoid too many workers overloading the system.
-    max_workers = min(max(max_workers, 1),
-                      subprocess_utils.get_parallel_threads())
-    logger.debug(f'Using {max_workers} workers for file mounts.')
-    return max_workers
-
-
-@_log_start_end
+@common.log_function_start_end
+@timeline.event
 def internal_file_mounts(cluster_name: str, common_file_mounts: Dict[str, str],
                          cluster_info: common.ClusterInfo,
                          ssh_credentials: Dict[str, str]) -> None:
@@ -515,4 +520,5 @@ def internal_file_mounts(cluster_name: str, common_file_mounts: Dict[str, str],
         digest=None,
         cluster_info=cluster_info,
         ssh_credentials=ssh_credentials,
-        max_workers=_max_workers_for_file_mounts(common_file_mounts))
+        max_workers=subprocess_utils.get_max_workers_for_file_mounts(
+            common_file_mounts, cluster_info.provider_name))

@@ -3,7 +3,7 @@
 Using Spot Instances for Serving
 ================================
 
-SkyServe supports serving models on a mixture of spot and on-demand replicas with two options: :code:`base_ondemand_fallback_replicas` and :code:`dynamic_ondemand_fallback`.
+SkyServe supports serving models on a mixture of spot and on-demand replicas with two options: :code:`base_ondemand_fallback_replicas` and :code:`dynamic_ondemand_fallback`. Currently, SkyServe relies on the user side to retry in the event of spot instance preemptions. 
 
 
 Base on-demand Fallback
@@ -96,7 +96,7 @@ When the service is up, we can check the status of the service and the replicas 
     http-server   3   1        -                          1 mins ago  1x GCP(vCPU=2)        PROVISIONING  us-east1     
     http-server   4   1        -                          1 min ago   1x GCP(vCPU=2)        PROVISIONING  us-central1
 
-When the required number of spot replicas are not available, SkyServe will provision the number of on-demand replicas needed to meet the target number of replicas. For example, when the target number is 2 and only 1 spot replica is ready, SkyServe will provision 1 on-demand replica to meet the target number of replicas. 
+When the required number of spot replicas are not available, SkyServe will provision on-demand replicas to meet the target number of replicas. For example, when the target number is 2 and no spot replicas are ready, SkyServe will provision 2 on-demand replicas to meet the target number of replicas. 
 
 .. code-block:: console
 

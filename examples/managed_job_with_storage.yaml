@@ -3,7 +3,7 @@
 # Runs a task that uses cloud buckets for uploading and accessing files.
 #
 # Usage:
-#   sky spot launch -c spot-storage examples/managed_job_with_storage.yaml
+#   sky jobs launch -c spot-storage examples/managed_job_with_storage.yaml
 #   sky down spot-storage
 
 resources:
@@ -15,13 +15,19 @@ workdir: ./examples
 
 file_mounts:
   ~/bucket_workdir:
-    # Change this to the your own globally unique bucket name.
+    # Change this to your own globally unique bucket name.
     name: sky-workdir-zhwu
     source: ./examples
     persistent: false
     mode: COPY
-  /imagenet-image:
-    source: s3://sky-imagenet-data
+
+  /output_path:
+    # Change this to your own globally unique bucket name.
+    name: sky-output-bucket
+    mode: MOUNT
+
+  /public-bucket:
+    source: s3://fah-public-data-covid19-cryptic-pockets
   
   # File mounts for folder
   /tmp/workdir: ~/tmp-workdir
@@ -43,7 +49,7 @@ run: |
   set -ex
   ls ~/sky_workdir/managed_job_with_storage.yaml
   ls ~/bucket_workdir/managed_job_with_storage.yaml
-  ls -l /imagenet-image/datasets
+  ls -l /public-bucket
   
 
   mkdir -p /data/logs
@@ -55,3 +61,6 @@ run: |
 
   cat ~/tmpfile
   cat ~/a/b/c/tmpfile
+  
+  # Write to a file in the mounted bucket
+  echo "hello world!" > /output_path/output.txt
